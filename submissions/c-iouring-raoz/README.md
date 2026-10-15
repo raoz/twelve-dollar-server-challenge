@@ -59,8 +59,13 @@ Each connection uses about 4.5 KB of kernel memory. Thus 2 GB of RAM holds about
   reads the ids, one counts the likes, and one reads the rows. If the ids are far apart, the server
   uses the reference query.
 - **More than 65,535 connections.** Each socket goes into an io_uring file table, not the process file
-  table. Each of the 8 worker threads has a table of 65,535 slots. When a table is almost full, the
-  next worker accepts the new connections.
+  table. Each of the 8 worker threads has a table of 65,535 slots, its own ring and its own listening
+  socket (`SO_REUSEPORT`): the kernel spreads new connections across all 8 from the first one, instead
+  of one worker's socket taking every connection until its table is nearly full. The database mutex
+  still serializes SQLite access, but request parsing, JSON and JWT checks now run on every core.
+  One caveat: `SO_REUSEPORT`'s hash can unevenly fill one worker's table before another's; a worker
+  stopping its own accept once its table is nearly full does not hand overflow to a different worker's
+  socket the way a single shared socket did.
 - **Memory limits.** The server reads `/proc/meminfo` four times each second. Below 192 MB of usable
   memory, it stops accepting connections. Below 96 MB, it closes idle connections. If the kernel kills
   the server, `start.sh` starts it again.
