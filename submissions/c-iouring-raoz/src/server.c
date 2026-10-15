@@ -11,7 +11,8 @@
  * - writes made while handling one batch of completions share one transaction (group commit),
  *   committed before any response of that batch is sent
  * - SQLite runs with locking_mode=EXCLUSIVE (one process, one connection): no lock syscalls per query
- * - the feed is built from three range scans instead of 20 correlated subqueries (see h_feed)
+ * - the feed is built from three range scans instead of 20 correlated subqueries (see rebuild_feed)
+ * - GET /feed serves a cached rendered body (see feed_cache) until a post or a like invalidates it
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -309,6 +310,18 @@ static sqlite3_stmt *st_feed, *st_post, *st_create, *st_like, *st_exists, *st_pi
 static int in_txn;
 static const char *db_path;
 
+/* The rendered /feed body, shared by every worker. GET /feed is by far the hottest endpoint (every
+ * loop iteration of bench/load.js hits it; only ~15%/2% like or create), and the three range scans in
+ * rebuild_feed() do not change unless a post or a like does, so cache the bytes and only redo them
+ * when a write invalidates the cache. This is a plain malloc/realloc buffer, not a buf_t: buf_t's
+ * backing chunks come from a per-thread arena (see chunk_get/chunk_put), which is only safe for a
+ * buffer whose whole lifetime stays on one thread. The malloc heap here is process-wide (see
+ * mallopt(M_ARENA_MAX, 1) in main), so any worker may build, grow or read this buffer. All access to
+ * it happens under db_mu, same as db/in_txn/st_*. */
+static char *feed_cache;
+static size_t feed_cache_len, feed_cache_cap;
+static int feed_cache_valid;
+
 #define POST_SELECT \
     "SELECT p.id, p.body, p.created_at, u.username, " \
     "(SELECT count(*) FROM likes l WHERE l.post_id = p.id) " \
@@ -399,6 +412,7 @@ static int txn_begin(void)
     sqlite3_reset(st_begin);
     if (rc != SQLITE_DONE) return 0;
     in_txn = 1;
+    feed_cache_valid = 0; /* a post or a like can change the top 20 or a like_count in it */
     return 1;
 }
 
@@ -515,21 +529,66 @@ static void internal_error(int fd)
     ERR(fd, 500, "internal server error");
 }
 
-/* The feed with the reference query: one correlated count(*) per post. */
-static void h_feed_ref(int fd)
+/* feed_cache's own reserve/put: always a plain realloc, never chunk_get/chunk_put (see the comment by
+ * its declaration). Mirrors buf_reserve/buf_put's shape so put_post's call pattern is easy to follow. */
+static void feed_cache_reserve(size_t extra)
 {
-    body.len = 0;
-    BUF_LIT(&body, "{\"posts\":[");
+    if (feed_cache_len + extra <= feed_cache_cap) return;
+    size_t cap = feed_cache_cap ? feed_cache_cap : 4096;
+    while (cap < feed_cache_len + extra) cap *= 2;
+    char *p = realloc(feed_cache, cap);
+    if (!p) abort();
+    feed_cache = p;
+    feed_cache_cap = cap;
+}
+static inline void feed_cache_put(const void *s, size_t n)
+{
+    feed_cache_reserve(n);
+    memcpy(feed_cache + feed_cache_len, s, n);
+    feed_cache_len += n;
+}
+
+/* Same fields and order as put_post, straight into feed_cache instead of a buf_t. */
+static void feed_cache_put_post(sqlite3_stmt *s, int64_t likes)
+{
+    const unsigned char *pb = sqlite3_column_text(s, 1);
+    int nb = sqlite3_column_bytes(s, 1);
+    const unsigned char *pc = sqlite3_column_text(s, 2);
+    int nc = sqlite3_column_bytes(s, 2);
+    const unsigned char *pu = sqlite3_column_text(s, 3);
+    int nu = sqlite3_column_bytes(s, 3);
+    feed_cache_reserve(160 + 6 * (size_t)(nb + nc + nu));
+    char *o = feed_cache + feed_cache_len;
+    memcpy(o, "{\"id\":", 6); o += 6;
+    o = u64_to(o, sqlite3_column_int64(s, 0));
+    memcpy(o, ",\"body\":\"", 9); o += 9;
+    o = json_escape(o, pb, nb);
+    memcpy(o, "\",\"created_at\":\"", 16); o += 16;
+    o = json_escape(o, pc, nc);
+    memcpy(o, "\",\"author\":\"", 12); o += 12;
+    o = json_escape(o, pu, nu);
+    memcpy(o, "\",\"like_count\":", 15); o += 15;
+    o = u64_to(o, likes);
+    *o++ = '}';
+    feed_cache_len = o - feed_cache;
+}
+
+/* Rebuilds feed_cache with the reference query: one correlated count(*) per post. Returns 0 on a
+ * SQLite error, 1 otherwise. Does not touch any connection; the caller responds from feed_cache. */
+static int rebuild_feed_ref(void)
+{
+    feed_cache_len = 0;
+    feed_cache_put("{\"posts\":[", 10);
     int rc, first = 1;
     while ((rc = sqlite3_step(st_feed)) == SQLITE_ROW) {
-        if (!first) buf_put(&body, ",", 1);
+        if (!first) feed_cache_put(",", 1);
         first = 0;
-        put_post(&body, st_feed, sqlite3_column_int64(st_feed, 4));
+        feed_cache_put_post(st_feed, sqlite3_column_int64(st_feed, 4));
     }
     sqlite3_reset(st_feed);
-    if (rc != SQLITE_DONE) { internal_error(fd); return; }
-    BUF_LIT(&body, "]}");
-    respond(fd, 200, body.p, body.len, 0);
+    if (rc != SQLITE_DONE) return 0;
+    feed_cache_put("]}", 2);
+    return 1;
 }
 
 /* The same result in fewer B-tree descents. The 20 newest posts nearly always have adjacent ids, so:
@@ -542,7 +601,8 @@ static void h_feed_ref(int fd)
 #define FEED_SPAN 256
 #endif
 
-static void h_feed(int fd)
+/* Rebuilds feed_cache. Returns 0 on a SQLite error, 1 otherwise; never touches a connection. */
+static int rebuild_feed(void)
 {
     int64_t ids[20], likes[20] = {0};
     uint32_t seg[20], seglen[20];
@@ -550,11 +610,11 @@ static void h_feed(int fd)
     int n = 0, rc;
     while (n < 20 && (rc = sqlite3_step(st_feed_ids)) == SQLITE_ROW) ids[n++] = sqlite3_column_int64(st_feed_ids, 0);
     sqlite3_reset(st_feed_ids);
-    if (n < 20 && rc != SQLITE_DONE) { internal_error(fd); return; }
-    if (!n) { respond(fd, 200, "{\"posts\":[]}", 12, 0); return; }
+    if (n < 20 && rc != SQLITE_DONE) return 0;
+    if (!n) { feed_cache_len = 0; feed_cache_put("{\"posts\":[]}", 12); return 1; }
     int64_t mn = ids[0], mx = ids[0];
     for (int k = 1; k < n; k++) { if (ids[k] < mn) mn = ids[k]; if (ids[k] > mx) mx = ids[k]; }
-    if (mx - mn >= FEED_SPAN) { h_feed_ref(fd); return; }
+    if (mx - mn >= FEED_SPAN) return rebuild_feed_ref();
     memset(slot, -1, mx - mn + 1);
     for (int k = 0; k < n; k++) slot[ids[k] - mn] = k;
 
@@ -565,8 +625,10 @@ static void h_feed(int fd)
         if (k >= 0) likes[k]++;
     }
     sqlite3_reset(st_like_range);
-    if (rc != SQLITE_DONE) { internal_error(fd); return; }
+    if (rc != SQLITE_DONE) return 0;
 
+    /* Fragments land in body (thread-local scratch, fully consumed before this call returns) in SQL
+     * row order, then get copied out to feed_cache in id order; see the comment above FEED_SPAN. */
     int found = 0;
     body.len = 0;
     sqlite3_bind_int64(st_feed_rows, 1, mn);
@@ -580,19 +642,30 @@ static void h_feed(int fd)
         found++;
     }
     sqlite3_reset(st_feed_rows);
-    if (rc != SQLITE_DONE) { internal_error(fd); return; }
-    if (found != n) { h_feed_ref(fd); return; } /* cannot happen without a concurrent writer */
+    if (rc != SQLITE_DONE) return 0;
+    if (found != n) return rebuild_feed_ref(); /* cannot happen without a concurrent writer */
 
-    /* assemble straight into the connection's output buffer */
-    char *o = respond_head(fd, 200, 10 + body.len + (n - 1) + 2, 0);
-    memcpy(o, "{\"posts\":[", 10); o += 10;
+    feed_cache_len = 0;
+    feed_cache_put("{\"posts\":[", 10);
     for (int k = 0; k < n; k++) {
-        if (k) *o++ = ',';
-        memcpy(o, body.p + seg[k], seglen[k]);
-        o += seglen[k];
+        if (k) feed_cache_put(",", 1);
+        feed_cache_put(body.p + seg[k], seglen[k]);
     }
-    memcpy(o, "]}", 2); o += 2;
-    conns[fd].out.len = o - conns[fd].out.p;
+    feed_cache_put("]}", 2);
+    return 1;
+}
+
+/* GET /feed: feed_cache holds the last rendered body, invalidated by txn_begin() (a post or a like is
+ * about to be written) and by end_batch() on a failed commit. Rebuilding is lazy: the next GET /feed
+ * after an invalidation redoes the three scans and refills the cache; every GET /feed until the next
+ * write, including others in the same completion batch, is a memcpy. */
+static void h_feed_cached(int fd)
+{
+    if (!feed_cache_valid) {
+        if (!rebuild_feed()) { internal_error(fd); return; }
+        feed_cache_valid = 1;
+    }
+    respond(fd, 200, feed_cache, feed_cache_len, 0);
 }
 
 static void h_post(int fd, int64_t id)
@@ -741,6 +814,9 @@ static void end_batch(void)
     if (failed) {
         sqlite3_step(st_rollback);
         sqlite3_reset(st_rollback);
+        /* a cache rebuilt while this transaction was open (txn_begin already invalidated it; a read
+         * in this same batch may have refilled it from the now-rolled-back rows) must not survive it */
+        feed_cache_valid = 0;
     }
     for (int i = 0; i < ntxn_resps; i++) {
         int fd = txn_resps[i].fd;
@@ -922,7 +998,7 @@ static void route(int fd, const char *m, size_t ml, const char *path, size_t pl,
             return;
         }
     } else if (pl == 5 && !memcmp(path, "/feed", 5)) {
-        if (get) { h_feed(fd); return; }
+        if (get) { h_feed_cached(fd); return; }
     } else if (pl == 6 && !memcmp(path, "/posts", 6)) {
         if (post) {
             auth_t a;
