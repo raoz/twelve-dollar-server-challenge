@@ -2,10 +2,12 @@
  *
  * - multishot accept straight into io_uring's registered file table (direct descriptors), multishot
  *   recv into provided buffers (idle connections hold no buffer)
- * - one loop thread does all the work until its file table is nearly full; then the next worker thread
- *   (its own ring and table) takes new connections. A table holds at most RLIMIT_NOFILE entries, so this
- *   is how one process holds more than 65535 keep-alive connections. Workers take turns on the database
- *   (a mutex held while a batch of completions is processed), so on one vCPU they never compete.
+ * - each worker owns its own ring, file table and listening socket (SO_REUSEPORT): the kernel spreads
+ *   new connections across all of them from the first one, instead of funneling every connection
+ *   through a single socket until its table is nearly full. A table holds at most RLIMIT_NOFILE
+ *   entries, so this is how one process holds more than 65535 keep-alive connections. Workers take
+ *   turns on the database (a mutex held while a batch of completions is processed), so on one vCPU
+ *   they never compete; on more vCPUs, request parsing, JSON and auth still run in parallel.
  * - responses are queued per connection and sent with one io_uring submission per loop iteration
  * - SQLite runs inline on the loop thread (every query is an index lookup in SQLite's page cache)
  * - writes made while handling one batch of completions share one transaction (group commit),
@@ -195,7 +197,11 @@ static __thread uint32_t accept_gen;
 static int nslots;      /* file table size per worker */
 static int mem_low;     /* 1: not accepting; 2, 3: also shedding idle connections (see check_memory) */
 static int64_t memcheck_q; /* quarter-second of the last memory check */
-static int listen_fd;
+/* Each worker owns its own listening socket (SO_REUSEPORT): the kernel spreads new connections across
+ * all of them by a hash of the client's address from the first connection, instead of one worker's
+ * socket taking every connection (via accept's exclusive wakeup) until its table is nearly full. */
+static __thread int listen_fd;
+static const char *listen_host, *listen_port;
 
 static struct io_uring_sqe *get_sqe(void)
 {
@@ -1152,7 +1158,10 @@ static void on_accept(struct io_uring_cqe *cqe, uint32_t gen)
     c->open = 1;
     nopen++;
     arm_recv(slot);
-    /* a full table would make the kernel drop accepted connections: hand new ones to the next worker */
+    /* a full table would make the kernel drop accepted connections: stop taking new ones on this
+     * worker's socket. With SO_REUSEPORT this does not hand them to another worker's socket (the
+     * kernel's reuseport hash already picked one by this point); it only matters once this worker
+     * alone is handling close to RLIMIT_NOFILE connections. */
     if (accepting && nslots - nopen < ACCEPT_STOP) stop_accept();
 }
 
@@ -1275,6 +1284,9 @@ static int make_listener(const char *host, const char *port)
     int fd = socket(res->ai_family, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    /* Lets every worker bind its own socket to the same host:port; the kernel load-balances new
+     * connections across the group by a hash of the client's address. */
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
     /* Inherited by accepted sockets. Keepalive reaps peers that vanished without a FIN or RST getting
      * through, so dead connections don't hold memory forever; live clients are never idle that long. */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -1364,6 +1376,7 @@ static int worker_init(int id)
     conns = calloc(nslots, sizeof *conns);
     dirty = calloc(nslots, sizeof *dirty);
     if (!conns || !dirty) { fprintf(stderr, "worker %d: out of memory\n", id); return -1; }
+    listen_fd = make_listener(listen_host, listen_port);
 
     /* Newer kernels charge ring memory to RLIMIT_MEMLOCK: on ENOMEM, retry smaller. On EINVAL (an
      * older kernel), retry without the optional flags. */
@@ -1539,7 +1552,8 @@ int main(int argc, char **argv)
     if (nslots <= ACCEPT_RESUME) { fprintf(stderr, "RLIMIT_NOFILE too low (%d)\n", nslots); return 1; }
 
     db_open();
-    listen_fd = make_listener(host, port);
+    listen_host = host;
+    listen_port = port;
     sem_init(&started, 0, 0);
     int nworkers = 0;
     for (int i = 0; i < NWORKERS; i++) {
