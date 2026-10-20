@@ -50,7 +50,7 @@ Each connection uses about 4.5 KB of kernel memory. Thus 2 GB of RAM holds about
 ## Design
 
 - **One event loop does the work.** The loop uses multishot accept, multishot recv and batched sends.
-  When the server is busy, the kernel wakes the loop after 128 completions or 4 ms.
+  When the server is busy, the kernel wakes the loop after 32 completions or 4 ms.
 - **SQLite runs on the loop thread.** Each request is a few B-tree lookups in the SQLite page cache.
   The database uses WAL with `synchronous=NORMAL` and `locking_mode=EXCLUSIVE`.
 - **Group commit.** The writes of one batch share one transaction. The server sends no response of the
